@@ -1,0 +1,267 @@
+name: Build A12Z IPA
+
+# Builds MeloNX for iOS with the A12Z fixes, on a GitHub runner. There is no local
+# build: the machine driving this has no Xcode.
+#
+# The chain, from distribution/ios/compile.sh and the Xcode project:
+#   1. dotnet publish Ryujinx.Headless.SDL2 as NativeAOT for ios-arm64 -> a .dylib
+#      (NativeAOT matters: .NET itself never JITs on iOS. The guest JIT is ARMeilleure,
+#       which is exactly the code these fixes touch.)
+#   2. stage that dylib where the Xcode project expects it
+#   3. xcodebuild the app
+#   4. package IPAs - unsigned for SideStore/AltStore, ad-hoc signed for TrollStore
+#
+# KNOWN RISK, stated up front rather than discovered in the log: the upstream snapshot
+# was cloned with GIT_LFS_SKIP_SMUDGE, so anything LFS-tracked is a ~130 byte pointer
+# file rather than a real binary. libMoltenVK.dylib is the one that matters - without it
+# there is no Vulkan and therefore no picture. The verify step checks for this explicitly
+# instead of shipping an IPA that cannot render.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Publish the IPAs as a GitHub Release under this tag (e.g. a12z-test1)'
+        required: false
+        default: ''
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - '.github/workflows/build-a12z-ipa.yml'
+
+concurrency:
+  group: build-a12z-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Environment
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          xcodebuild -version
+          echo "iOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+          df -h / | tail -1
+
+      # global.json pins 8.0.100; the csproj targets net8.0 with PublishAot.
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+
+      - name: Report .NET
+        run: dotnet --info | head -25
+
+      - name: Install iOS workload (best effort)
+        continue-on-error: true
+        run: |
+          dotnet workload install ios --skip-manifest-update || dotnet workload install ios || \
+            echo "::warning::iOS workload install failed; relying on NuGet for the runtime pack"
+
+      - name: Restore
+        run: dotnet restore 2>&1 | tail -20
+
+      - name: Publish the Ryujinx core (NativeAOT, ios-arm64)
+        run: |
+          set -o pipefail
+          dotnet publish -c Release -r ios-arm64 \
+            -p:ExtraDefineConstants=DISABLE_UPDATER \
+            src/Ryujinx.Headless.SDL2 \
+            --self-contained true 2>&1 | tee dotnet-publish.log | tail -40
+
+      - name: Stage the dylib where Xcode expects it
+        run: |
+          set -u
+          echo "--- what publish produced ---"
+          find src/Ryujinx.Headless.SDL2/bin -name 'Ryujinx.Headless.SDL2.dylib' -print 2>/dev/null || true
+          SRC=$(find src/Ryujinx.Headless.SDL2/bin -name 'Ryujinx.Headless.SDL2.dylib' -type f 2>/dev/null | head -1)
+          if [ -z "$SRC" ]; then
+            echo "::error::NativeAOT did not produce the dylib - see dotnet-publish.log"; exit 1
+          fi
+          echo "using $SRC ($(stat -f%z "$SRC") bytes)"
+          file "$SRC"
+          # compile.sh and the Xcode script phase disagree about native/ vs publish/, so
+          # satisfy both.
+          for d in "src/Ryujinx.Headless.SDL2/bin/Release/net8.0/ios-arm64/publish" \
+                   "src/MeloNX/MeloNX/Dependencies/Dynamic Libraries" \
+                   "src/MeloNX/MeloNX/Core/Dependencies/Dynamic Libraries"; do
+            [ -d "$d" ] && cp -f "$SRC" "$d/Ryujinx.Headless.SDL2.dylib" && echo "staged -> $d"
+          done
+
+      # Anything LFS-tracked came down as a pointer. libMoltenVK is the one that matters.
+      - name: Check for unresolved LFS pointers
+        run: |
+          set -u
+          BAD=0
+          while IFS= read -r f; do
+            sz=$(stat -f%z "$f")
+            if [ "$sz" -lt 1024 ] && head -c 60 "$f" | grep -q "git-lfs"; then
+              echo "::warning::LFS POINTER, not a real binary ($sz bytes): $f"; BAD=1
+            fi
+          done < <(find src -name '*.dylib' -o -name 'libMoltenVK*' 2>/dev/null)
+          echo "lfs_unresolved=$BAD" >> "$GITHUB_ENV"
+          [ "$BAD" -eq 1 ] && echo "::warning::MoltenVK is likely missing; the app may build but cannot render."
+          true
+
+      - name: Recover MoltenVK if it is a pointer
+        if: env.lfs_unresolved == '1'
+        continue-on-error: true
+        run: |
+          set -u
+          MV=$(find "$HOME/.nuget/packages" -name 'libMoltenVK.dylib' -type f 2>/dev/null | head -1)
+          if [ -n "$MV" ]; then
+            echo "recovered MoltenVK from NuGet: $MV ($(stat -f%z "$MV") bytes)"
+            find src -name 'libMoltenVK.dylib' | while read -r dst; do cp -f "$MV" "$dst"; echo "replaced $dst"; done
+          else
+            echo "::warning::no MoltenVK in the NuGet cache either"
+          fi
+
+      - name: Build the app
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project src/MeloNX/MeloNX.xcodeproj \
+            -scheme MeloNX \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" DEVELOPMENT_TEAM="" \
+            build 2>&1 | tee xcodebuild.log | tail -60
+
+      - name: Locate the product
+        id: app
+        run: |
+          APP=$(find build -name '*.app' -type d -path '*iphoneos*' | head -1)
+          [ -z "$APP" ] && { echo "::error::no .app produced"; exit 1; }
+          echo "found: $APP"; echo "path=$APP" >> "$GITHUB_OUTPUT"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist" || true
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist" || true
+
+      - name: Package IPAs
+        run: |
+          set -u
+          APPSRC="${{ steps.app.outputs.path }}"
+          NAME=$(basename "$APPSRC" .app)
+
+          # 1. unsigned - SideStore / AltStore re-sign with the user's Apple ID at install
+          rm -rf Payload; mkdir -p Payload; cp -R "$APPSRC" "Payload/$NAME.app"
+          zip -qry "MeloNX-A12Z-unsigned.ipa" Payload; rm -rf Payload
+
+          # 2. ad-hoc signed with entitlements genuinely embedded - TrollStore.
+          # Entitlements only exist inside a signature, so the unsigned build above
+          # carries none; JIT needs them present or a debugger attached.
+          cat > /tmp/ts.entitlements <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>get-task-allow</key><true/>
+            <key>com.apple.developer.kernel.increased-memory-limit</key><true/>
+            <key>com.apple.developer.kernel.extended-virtual-addressing</key><true/>
+            <key>dynamic-codesigning</key><true/>
+            <key>com.apple.security.cs.allow-jit</key><true/>
+            <key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>
+            <key>platform-application</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          rm -rf Payload; mkdir -p Payload; cp -R "$APPSRC" "Payload/$NAME.app"
+          A="Payload/$NAME.app"
+          find "$A" \( -name '*.framework' -o -name '*.dylib' \) -print0 | while IFS= read -r -d '' f; do
+            codesign --force --sign - --timestamp=none "$f" 2>/dev/null || true
+          done
+          # --generate-entitlement-der is mandatory: iOS 15+ reads the DER form, and a
+          # signature carrying only the XML form is treated as having no entitlements.
+          codesign --force --sign - --timestamp=none --entitlements /tmp/ts.entitlements \
+                   --generate-entitlement-der "$A"
+          codesign -d --entitlements - "$A" 2>&1 | head -20 || true
+          zip -qry "MeloNX-A12Z-trollstore.ipa" Payload; rm -rf Payload
+          ls -lh *.ipa
+
+      - name: Verify the IPAs
+        run: |
+          set -u
+          for ipa in *.ipa; do
+            echo "=========== $ipa ($(du -h "$ipa" | cut -f1)) ==========="
+            rm -rf /tmp/v && mkdir -p /tmp/v && unzip -qo "$ipa" -d /tmp/v
+            A=$(find /tmp/v -name '*.app' -maxdepth 2 -type d | head -1)
+            echo "bundle id:   $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$A/Info.plist" 2>/dev/null || echo '?')"
+            echo "min iOS:     $(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$A/Info.plist" 2>/dev/null || echo '?')"
+            echo "arch:        $(lipo -archs "$A/$(basename "$A" .app)" 2>/dev/null || echo '?')"
+            RJ=$(find "$A" -name 'Ryujinx.Headless.SDL2.dylib' | head -1)
+            echo "ryujinx core: ${RJ:+$(stat -f%z "$RJ") bytes}${RJ:-NOT BUNDLED}"
+            MV=$(find "$A" -name 'libMoltenVK*' | head -1)
+            if [ -n "$MV" ]; then
+              s=$(stat -f%z "$MV")
+              echo "moltenvk:    $s bytes"
+              [ "$s" -lt 100000 ] && echo "::warning::MoltenVK looks like an LFS pointer - this build cannot render"
+            else
+              echo "::warning::MoltenVK NOT BUNDLED - this build cannot render"
+            fi
+          done
+
+      - name: Upload IPAs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: melonx-a12z-ipas
+          path: '*.ipa'
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: |
+            xcodebuild.log
+            dotnet-publish.log
+          if-no-files-found: warn
+
+      - name: Publish release
+        if: ${{ github.event.inputs.release_tag != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.event.inputs.release_tag }}" \
+            --repo "${{ github.repository }}" \
+            --title "MeloNX A12Z test build ${{ github.event.inputs.release_tag }}" \
+            --notes "A MeloNX build carrying the A12Z fixes. **For 2020 iPad Pro (A12Z) testing.**
+
+          Two IPAs:
+          * \`MeloNX-A12Z-unsigned.ipa\` — SideStore / AltStore (re-signed with your Apple ID; enable JIT with StikDebug)
+          * \`MeloNX-A12Z-trollstore.ipa\` — TrollStore (entitlements embedded, JIT without a debugger)
+
+          ### What changed
+          The JIT allocator path that only A12Z takes. Every A13+ device reports TXM and uses
+          BreakpointJIT; A12Z reports non-TXM and uses a plain mmap + vm_remap path. That path
+          mapped its RX region without PROT_WRITE and then tried to make a vm_remap alias
+          writable, which vm_remap can refuse since it caps the alias at the source's
+          max_protection. It also asked for a 1 GB JIT cache where TXM devices ask for 512 MB.
+
+          Both are fixed, failures now fall back instead of throwing, and every attempt is
+          logged. See README-A12Z.md.
+
+          ### This is a diagnostic build
+          Nothing here has run on an A12Z. **Please report the log either way** — README-A12Z.md
+          has a table of what each line means. A log saying it still fails is as useful as one
+          saying it works.
+
+          You supply your own prod.keys, firmware and games. None are included." \
+            *.ipa || gh release upload "${{ github.event.inputs.release_tag }}" *.ipa --clobber
