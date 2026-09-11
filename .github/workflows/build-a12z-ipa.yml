@@ -99,7 +99,10 @@ jobs:
           for d in "src/Ryujinx.Headless.SDL2/bin/Release/net8.0/ios-arm64/publish" \
                    "src/MeloNX/MeloNX/Dependencies/Dynamic Libraries" \
                    "src/MeloNX/MeloNX/Core/Dependencies/Dynamic Libraries"; do
-            [ -d "$d" ] && cp -f "$SRC" "$d/Ryujinx.Headless.SDL2.dylib" && echo "staged -> $d"
+            # `|| true` matters: the shell runs with -e, and a missing directory makes
+            # the test return 1, which killed the whole step even though staging had
+            # already succeeded everywhere the directory did exist.
+            if [ -d "$d" ]; then cp -f "$SRC" "$d/Ryujinx.Headless.SDL2.dylib" && echo "staged -> $d"; else echo "skip (absent): $d"; fi
           done
 
       # Anything LFS-tracked came down as a pointer. libMoltenVK is the one that matters.
