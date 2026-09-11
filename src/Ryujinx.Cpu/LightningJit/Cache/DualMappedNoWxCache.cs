@@ -11,7 +11,23 @@ namespace Ryujinx.Cpu.LightningJit.Cache
     class DualMappedNoWxCache : IDisposable
     {
         private const int CodeAlignment = 4; // Bytes.
-        private ulong SharedCacheSize = DualMappedJitAllocator.hasTXM ? (ulong)512 * 1024 * 1024 : 1024 * 1024 * 1024;
+        // A12Z NOTE. This line asked non-TXM devices for TWICE what TXM devices get:
+        // 1 GB against 512 MB. Every A13 and later chip reports TXM, so in practice the
+        // only device that ever took the 1 GB branch is the A12Z - and it is a single
+        // contiguous executable mapping, dual-mapped, so it costs 2 GB of address space
+        // before LocalCacheSize's 256 MB (another 512 MB dual-mapped) and before the
+        // guest's own 3+ GB.
+        //
+        // On a 6 GB iPad without extended-virtual-addressing that request is exactly the
+        // kind that fails. When it does, DualMappedJitAllocator throws from a field
+        // initialiser, which surfaces as a TypeInitializationException, kills the
+        // emulation thread, and leaves the UI on a black surface forever while the
+        // process holds nothing - the reported symptom being a black screen that loads
+        // forever at 60-70 MB.
+        //
+        // There is no reason the weaker device should ask for more. 512 MB for both, and
+        // MemoryCache halves on failure rather than giving up.
+        private ulong SharedCacheSize = 512 * 1024 * 1024;
         private ulong LocalCacheSize = 256 * 1024 * 1024;
 
         // How many calls to the same function we allow until we pad the shared cache to force the function to become available there
@@ -20,8 +36,8 @@ namespace Ryujinx.Cpu.LightningJit.Cache
 
         private class MemoryCache : IDisposable
         {
-            private readonly DualMappedJitAllocator _allocator;
-            private readonly CacheMemoryAllocator _cacheAllocator;
+            private DualMappedJitAllocator _allocator;
+            private CacheMemoryAllocator _cacheAllocator;
             public DualMappedJitAllocator Allocator => _allocator;
             public IntPtr RwPointer => _allocator.RwPtr;
             public IntPtr RxPointer => _allocator.RxPtr;
@@ -31,8 +47,45 @@ namespace Ryujinx.Cpu.LightningJit.Cache
 
             public MemoryCache(ulong size)
             {
-                _allocator = new DualMappedJitAllocator(size);
-                _cacheAllocator = new((int)size);
+                // Halve and retry rather than fail outright. A single contiguous
+                // executable mapping this large is the most fragile allocation the
+                // emulator makes, and a smaller JIT cache only costs some recompilation -
+                // whereas failing here stops emulation entirely, because there is no
+                // interpreter to fall back to.
+                const ulong MinSize = 64UL * 1024 * 1024;
+                Exception lastError = null;
+
+                for (ulong attempt = size; attempt >= MinSize; attempt /= 2)
+                {
+                    try
+                    {
+                        _allocator = new DualMappedJitAllocator(attempt);
+                        _cacheAllocator = new((int)attempt);
+
+                        if (attempt != size)
+                        {
+                            Ryujinx.Common.Logging.Logger.Warning?.Print(
+                                Ryujinx.Common.Logging.LogClass.Cpu,
+                                $"JIT cache reduced to {attempt / (1024 * 1024)} MB; " +
+                                $"{size / (1024 * 1024)} MB could not be mapped. " +
+                                "Expect more recompilation, not incorrect behaviour.");
+                        }
+
+                        return;
+                    }
+                    catch (Exception e)
+                    {
+                        lastError = e;
+                        Ryujinx.Common.Logging.Logger.Warning?.Print(
+                            Ryujinx.Common.Logging.LogClass.Cpu,
+                            $"Could not map a {attempt / (1024 * 1024)} MB JIT cache: {e.Message}");
+                    }
+                }
+
+                throw new Exception(
+                    $"Could not allocate a JIT cache at any size between {size / (1024 * 1024)} MB " +
+                    $"and {MinSize / (1024 * 1024)} MB. Emulation cannot start: this build has no " +
+                    "interpreter to fall back on.", lastError);
             }
 
             public int Allocate(int codeSize)
