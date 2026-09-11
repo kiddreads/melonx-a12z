@@ -13,8 +13,12 @@ On an A12Z the app launches, a game starts loading, and then:
 - **black screen, loading forever** — it does not crash, it hangs
 - the process sits at **60–70 MB of RAM**
 
-Reported independently by more than one A12Z owner, with identical wording. Not a
-one-off install problem.
+Reported independently by more than one A12Z owner, with identical wording, on
+correctly configured setups: entitlements active, JIT enabled, plenty of RAM.
+
+**It is not a memory problem.** The same emulator works on other 6 GB devices. It
+fails on A12Z at every RAM size. Anything that explains this has to be
+capacity-independent and entitlement-independent.
 
 That number is the whole clue. A Switch emulator that had started would be holding *gigabytes* —
 guest RAM alone is over 3 GB. Sixty megabytes means **the emulator never allocated anything at
@@ -47,7 +51,7 @@ It also explains why the bug looks unique to one chip. A12 and A12X are `HAS_TXM
 have 4 GB of RAM, so nobody runs a Switch emulator on them. **The A12Z is the only non-TXM device
 anyone actually tries.**
 
-## The size, which is the likely cause
+## A size asymmetry — real, but NOT the cause
 
 `src/Ryujinx.Cpu/LightningJit/Cache/DualMappedNoWxCache.cs`:
 
@@ -56,21 +60,24 @@ private ulong SharedCacheSize = DualMappedJitAllocator.hasTXM ? 512 MB : 1024 MB
 private ulong LocalCacheSize  = 256 MB;
 ```
 
-**The non-TXM device asks for twice what every TXM device asks for.** A12Z requests a
-**1 GB single contiguous executable mapping**, dual-mapped — so 2 GB of address space —
-plus another 512 MB for the local cache, before the guest's own 3+ GB. On a 6 GB iPad
-without `extended-virtual-addressing`, that is exactly the allocation that fails.
+**The non-TXM device asks for twice what every TXM device asks for** — 1 GB against
+512 MB, as a single contiguous executable mapping, dual-mapped.
 
-And `SharedCacheSize` is a field initialiser, so a throw from `DualMappedJitAllocator`
-surfaces as a `TypeInitializationException`. That kills the emulation thread without
-taking the app down — which is why it **hangs on a black screen instead of crashing**,
-and why the process never grows past its launch footprint.
+This was initially suspected as the cause. **It is not.** The bug occurs with
+`extended-virtual-addressing` active and at every RAM size, and other 6 GB devices are
+fine. A device with the entitlement and 6 GB free can map a gigabyte.
 
-Black screen, infinite load, and 60–70 MB are all the same event.
+It is still changed here, because there is no reason the weaker device should ask for
+more than the stronger one, and because the retry makes a real failure diagnosable
+instead of fatal. But it is a defensive change, not the fix.
 
-There is no reason the weaker device should ask for more than the stronger one.
+What *is* significant is the failure mode: `SharedCacheSize` feeds a field initialiser, so
+a throw from `DualMappedJitAllocator` surfaces as a `TypeInitializationException`, which
+kills the emulation thread without taking the app down. That is why the symptom is a
+black screen that loads forever rather than a crash, and why the process never grows past
+its launch footprint. Black screen, infinite load and 60–70 MB are one event.
 
-## The second defect, in the same path
+## The actual suspect: a protection failure, not a capacity one
 
 ```csharp
 mmap(..., PROT_READ | PROT_EXEC, ...)              // mapped WITHOUT write
@@ -78,13 +85,19 @@ vm_remap(...)                                       // alias the same pages
 vm_protect(bufRW, VM_PROT_READ | VM_PROT_WRITE)     // now make the alias writable
 ```
 
-`vm_remap` caps the new mapping's `max_protection` at the source's. The source was created with no
-`PROT_WRITE`, so the alias may never be permitted to become writable, and the `vm_protect` is
-refused.
+`vm_remap` caps the new mapping's `max_protection` at the source's. The source was created
+with no `PROT_WRITE`, so the alias can never be permitted to become writable, and the
+`vm_protect` that follows is refused.
 
-And **every failure in that function threw immediately** — no fallback, no diagnostics beyond a
-Mach error number. A throw there means no guest memory is ever allocated, which presents as an app
-idling at 60–70 MB. The failure and the symptom match exactly.
+**This fits every fact.** It fails the same way at 6 GB and at 16 GB. It fails with every
+entitlement held. It is deterministic, not marginal. And it only ever runs on A12Z, because
+every A13+ device reports TXM and takes `BreakpointJIT.framework` instead.
+
+The honest way to put the whole bug: **this code path is broken on iOS, and A12Z is simply
+the only device that runs it.** It looks chip-specific because the chip selects the path.
+
+And **every failure in that function threw immediately** — no fallback, no diagnostics beyond
+a Mach error number — so the one device affected got no information at all.
 
 ## What this clone changes
 
