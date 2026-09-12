@@ -19,7 +19,26 @@ namespace ARMeilleure.Translation.Cache
 
         private const int CodeAlignment = 4; // Bytes.
         private const int CacheSize = 2047 * 1024 * 1024;
-        private const int CacheSizeIOS = 512 * 1024 * 1024;
+
+        // A12Z NOTE (2026-09-12). This is a THIRD, independent JIT allocator, separate
+        // from Ryujinx.Cpu.LightningJit.Cache.DualMappedNoWxCache (already reduced to
+        // 256+128 MB there). ArmProcessContextFactory picks the CPU engine on
+        // MemoryManagerMode: HostMapped/HostMappedUnsafe use LightningJitEngine (that
+        // other cache); anything else - including SoftwarePageTable, and Software is
+        // what a real A12Z device log showed being tried - falls back to the classic
+        // JitEngine, whose Translator goes through THIS JitCache instead.
+        //
+        // A real device log (DUAL_MAPPED_JIT=1) shows this class asking for 512 MB -
+        // dual-mapped, so 1 GB of address space - AFTER the LightningJit caches had
+        // already committed roughly 768 MB. Both the plain mmap(RWX) and mmap(RX)
+        // attempts returned -1 outright (not a permission failure - an allocation
+        // failure), which is consistent with the process running out of a large enough
+        // contiguous free region rather than being denied executable memory.
+        //
+        // Halved to 256 MB, so this cache and LightningJit's now request comparable,
+        // additive-but-survivable amounts instead of the smaller cache reducing its ask
+        // while this one kept demanding a full 512 MB (1 GB dual-mapped) regardless.
+        private const int CacheSizeIOS = 256 * 1024 * 1024;
 
         private static ReservedRegion _jitRegion;
         private static DualMappedJitAllocator _jitRegion26;
