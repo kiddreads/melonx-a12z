@@ -27,8 +27,27 @@ namespace Ryujinx.Cpu.LightningJit.Cache
         //
         // There is no reason the weaker device should ask for more. 512 MB for both, and
         // MemoryCache halves on failure rather than giving up.
-        private ulong SharedCacheSize = 512 * 1024 * 1024;
-        private ulong LocalCacheSize = 256 * 1024 * 1024;
+        // Sizes cut again after a real A12Z run (2026-09-12). The JIT mapping itself now
+        // succeeds - the device log shows "JIT dual mapping established" with max=0x7 - and
+        // boot proceeds all the way through loading the NSP, firmware and every NSO. It then
+        // dies here instead:
+        //
+        //   System.SystemException: Cannot allocate memory
+        //     at MemoryManagementUnix.AllocateInternal
+        //     at MemoryBlock..ctor
+        //     at NativePageTable..ctor
+        //     at MemoryManagerHostTracked..ctor
+        //
+        // That is address space, not RAM. Every one of these caches is DUAL mapped, so the
+        // cost is twice the number written here: 512 + 256 was already consuming ~1.5 GB of
+        // virtual address space before the guest memory manager asked for its page table.
+        // 256 + 128 halves that to ~768 MB and leaves room for the guest.
+        //
+        // The cost is more recompilation, which is a slower emulator. Not booting at all is
+        // not a faster one. MemoryCache also halves further on failure, so a device with even
+        // less headroom degrades rather than throwing.
+        private ulong SharedCacheSize = 256 * 1024 * 1024;
+        private ulong LocalCacheSize = 128 * 1024 * 1024;
 
         // How many calls to the same function we allow until we pad the shared cache to force the function to become available there
         // and allow the guest to take the fast path.
