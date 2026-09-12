@@ -121,8 +121,9 @@ jobs:
             fi
           done < <(find src -name '*.dylib' -o -name 'libMoltenVK*' 2>/dev/null)
           echo "lfs_unresolved=$BAD" >> "$GITHUB_ENV"
-          [ "$BAD" -eq 1 ] && echo "::warning::MoltenVK is likely missing; the app may build but cannot render."
-          true
+          if [ "$BAD" -eq 1 ]; then
+            echo "::warning::MoltenVK is likely missing; the app may build but cannot render."
+          fi
 
       - name: Recover MoltenVK if it is a pointer
         if: env.lfs_unresolved == '1'
@@ -154,7 +155,7 @@ jobs:
         id: app
         run: |
           APP=$(find build -name '*.app' -type d -path '*iphoneos*' | head -1)
-          [ -z "$APP" ] && { echo "::error::no .app produced"; exit 1; }
+          if [ -z "$APP" ]; then echo "::error::no .app produced"; exit 1; fi
           echo "found: $APP"; echo "path=$APP" >> "$GITHUB_OUTPUT"
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist" || true
           /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist" || true
@@ -201,6 +202,9 @@ jobs:
           ls -lh *.ipa
 
       - name: Verify the IPAs
+        # Reporting only - it must never be the reason a good build fails. The previous
+        # run died here precisely BECAUSE MoltenVK was present: `[ $s -lt 100000 ] && echo`
+        # returns 1 when the test is false, and steps run under bash -e.
         run: |
           set -u
           for ipa in *.ipa; do
@@ -216,7 +220,11 @@ jobs:
             if [ -n "$MV" ]; then
               s=$(stat -f%z "$MV")
               echo "moltenvk:    $s bytes"
-              [ "$s" -lt 100000 ] && echo "::warning::MoltenVK looks like an LFS pointer - this build cannot render"
+              if [ "$s" -lt 100000 ]; then
+                echo "::warning::MoltenVK looks like an LFS pointer - this build cannot render"
+              else
+                echo "moltenvk looks real"
+              fi
             else
               echo "::warning::MoltenVK NOT BUNDLED - this build cannot render"
             fi
