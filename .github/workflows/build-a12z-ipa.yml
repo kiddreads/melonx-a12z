@@ -39,7 +39,11 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-15
+    # NOTE (2026-09-12): was macos-15. Upstream MeloNX uses iOS 26 SwiftUI APIs
+    # (sharedBackgroundVisibility in GamesListView+ToolBar.swift), which the Xcode 16.4 /
+    # iOS 18 SDK on macos-15 does not have: runs 34655355564 and 34655631834 failed there
+    # with "cannot infer contextual base in reference to member hidden". Not an A12Z issue.
+    runs-on: macos-26
     timeout-minutes: 120
 
     steps:
